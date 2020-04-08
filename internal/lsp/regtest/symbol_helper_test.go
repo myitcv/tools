@@ -21,15 +21,18 @@ type expSymbolInformation struct {
 	Name     *string
 	Kind     *protocol.SymbolKind
 	Location *expLocation
+
+	// Not is a special field to indicate this entry should not be found
+	Not bool
 }
 
 func (e *expSymbolInformation) matchAgainst(sis []fake.SymbolInformation) bool {
 	for _, si := range sis {
 		if e.match(si) {
-			return true
+			return !e.Not
 		}
 	}
-	return false
+	return e.Not
 }
 
 func (e *expSymbolInformation) match(si fake.SymbolInformation) bool {

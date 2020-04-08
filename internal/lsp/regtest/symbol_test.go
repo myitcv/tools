@@ -5,6 +5,7 @@
 package regtest
 
 import (
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/internal/lsp/fake"
@@ -51,6 +52,19 @@ const Message = "Hello World." // constant
 
 var caseSensitiveSymbolChecks = map[string]*expSymbolInformation{
 	"main": {
+		Name: pString("mod.com.main"),
+		Kind: pKind(protocol.Function),
+		Location: &expLocation{
+			Path: pString("main.go"),
+			Range: &expRange{
+				Start: &expPos{
+					Line:   pInt(7),
+					Column: pInt(5),
+				},
+			},
+		},
+	},
+	"main packageOnly::file://main.go": {
 		Name: pString("mod.com.main"),
 		Kind: pKind(protocol.Function),
 		Location: &expLocation{
@@ -118,6 +132,15 @@ var caseSensitiveSymbolChecks = map[string]*expSymbolInformation{
 	"NewEncoder": {
 		Name: pString("encoding/json.NewEncoder"),
 		Kind: pKind(protocol.Function),
+	},
+	"encoding/json.nonSpace": {
+		Name: pString("encoding/json.nonSpace"),
+		Kind: pKind(protocol.Function),
+	},
+	"encoding/json.nonSpace nonWorkspaceExportedOnly::true": {
+		Name: pString("encoding/json.nonSpace"),
+		Kind: pKind(protocol.Function),
+		Not:  true,
 	},
 	"myStruct": {
 		Name: pString("mod.com.myStruct"),
@@ -199,6 +222,8 @@ func checkChecks(t *testing.T, matcher string, checks map[string]*expSymbolInfor
 	runner.Run(t, symbolSetup, func(t *testing.T, env *Env) {
 		t.Run(matcher, func(t *testing.T) {
 			for query, exp := range checks {
+				// Update the query based on the URI of the Workdir
+				query = strings.Replace(query, "file://", string(env.Sandbox.Workdir.RootURI())+"/", -1)
 				t.Run(query, func(t *testing.T) {
 					res := env.Symbol(query)
 					if !exp.matchAgainst(res) {

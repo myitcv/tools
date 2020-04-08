@@ -11,17 +11,31 @@ import (
 	"go/token"
 	"go/types"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/fuzzy"
 	"golang.org/x/tools/internal/lsp/protocol"
+	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
 )
 
 // maxSymbols defines the maximum number of protocol.SymbolInformation results
 // that should ever be sent in response to a client
 const maxSymbols = 100
+
+type symbolOption string
+
+const (
+	optionSeparator                                   = "::"
+	symbolOptionStructFields             symbolOption = "structFields"
+	symbolOptionInterfaceMethods         symbolOption = "interfaceMethods"
+	symbolOptionKind                     symbolOption = "kind"
+	symbolOptionPackageOnly              symbolOption = "packageOnly"
+	symbolOptionWorkspaceOnly            symbolOption = "workspaceOnly"
+	symbolOptionNonWorkspaceExportedOnly symbolOption = "nonWorkspaceExportedOnly"
+)
 
 // WorkspaceSymbols matches symbols across views using the given query,
 // according to the SymbolMatcher matcher.
@@ -74,9 +88,72 @@ type symbolCollector struct {
 	// seen is a map of the symbols we have already visited. See the comment for
 	// viewsToPackages
 	seen map[symbolInformation]bool
+
+	// options
+	workspaceOnly            bool
+	nonWorkspaceExportedOnly bool
+	packageOnly              *string
+	kinds                    map[protocol.SymbolKind]bool
+	structFields             bool
+	interfaceMethods         bool
+
+	exportedOnly bool
 }
 
 func newSymbolCollector(ctx context.Context, matcher SymbolMatcher, query string, views []View) *symbolCollector {
+	res := &symbolCollector{
+		ctx:   ctx,
+		views: views,
+		seen:  make(map[symbolInformation]bool),
+
+		// option defaults
+		structFields:     true,
+		interfaceMethods: true,
+	}
+	// Parse options
+	var queryParts []string
+	for _, part := range strings.Fields(query) {
+		if ok, v := tokenIsOption(part, symbolOptionWorkspaceOnly); ok {
+			if b, err := strconv.ParseBool(v); err == nil {
+				res.workspaceOnly = b
+			}
+			continue
+		}
+		if ok, v := tokenIsOption(part, symbolOptionNonWorkspaceExportedOnly); ok {
+			if b, err := strconv.ParseBool(v); err == nil {
+				res.nonWorkspaceExportedOnly = b
+			}
+			continue
+		}
+		if ok, v := tokenIsOption(part, symbolOptionPackageOnly); ok {
+			res.packageOnly = &v
+			continue
+		}
+		if ok, v := tokenIsOption(part, symbolOptionKind); ok {
+			parts := strings.Split(v, ",")
+			res.kinds = make(map[protocol.SymbolKind]bool)
+			for _, k := range parts {
+				res.kinds[protocol.ParseSymbolKind(k)] = true
+			}
+			continue
+		}
+		if ok, v := tokenIsOption(part, symbolOptionStructFields); ok {
+			if b, err := strconv.ParseBool(v); err == nil {
+				res.structFields = b
+			}
+			continue
+		}
+		if ok, v := tokenIsOption(part, symbolOptionInterfaceMethods); ok {
+			if b, err := strconv.ParseBool(v); err == nil {
+				res.interfaceMethods = b
+			}
+			continue
+		}
+		queryParts = append(queryParts, part)
+	}
+	query = strings.Join(queryParts, " ")
+
+	// Setup matcher
 	var m symbolMatcher
 	switch matcher {
 	case SymbolFuzzy:
@@ -88,12 +165,9 @@ func newSymbolCollector(ctx context.Context, matcher SymbolMatcher, query string
 	default:
 		panic(fmt.Errorf("unkown Matcher type: %v", matcher))
 	}
-	return &symbolCollector{
-		ctx:     ctx,
-		views:   views,
-		matcher: m,
-		seen:    make(map[symbolInformation]bool),
-	}
+	res.matcher = m
+
+	return res
 }
 
 // walk walks sc.views gathering symbols and returns the results
@@ -116,6 +190,7 @@ func (sc *symbolCollector) walk() (_ []protocol.SymbolInformation, err error) {
 	for _, pv := range toWalk {
 		sc.currPkg = pv.pkg
 		sc.currView = pv.view
+		sc.exportedOnly = sc.nonWorkspaceExportedOnly && !pv.isWorkspace
 		for _, fh := range pv.pkg.CompiledGoFiles() {
 			file, _, _, _, err := fh.Cached()
 			sc.check(err, "failed to get Cached file handle: %v", err)
@@ -151,19 +226,37 @@ func (sc *symbolCollector) walk() (_ []protocol.SymbolInformation, err error) {
 func (sc *symbolCollector) viewsToPackages() (toWalk []*pkgView, err error) {
 	gather := make(map[string]map[*types.Package]*pkgView)
 	for _, v := range sc.views {
+		snap := v.Snapshot()
+
 		seen := make(map[string]*pkgView)
 		var forTests []*pkgView
-		knownPkgs, err := v.Snapshot().KnownPackages(sc.ctx)
+		var err error
+		var knownPkgs []PackageHandle
+		if sc.packageOnly != nil {
+			fh, err := snap.GetFile(sc.ctx, span.URI(*sc.packageOnly))
+			if err != nil {
+				// Not in this view
+				continue
+			}
+			knownPkgs, err = snap.PackageHandles(sc.ctx, fh)
+		} else if sc.workspaceOnly {
+			knownPkgs, err = snap.WorkspacePackages(sc.ctx)
+		} else {
+			knownPkgs, err = snap.KnownPackages(sc.ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
-		workspacePackages, err := v.Snapshot().WorkspacePackages(sc.ctx)
-		if err != nil {
-			return nil, err
-		}
-		isWorkspacePkg := make(map[PackageHandle]bool)
-		for _, wp := range workspacePackages {
-			isWorkspacePkg[wp] = true
+		var isWorkspacePkg map[PackageHandle]bool
+		if !sc.workspaceOnly {
+			workspacePackages, err := snap.WorkspacePackages(sc.ctx)
+			if err != nil {
+				return nil, err
+			}
+			isWorkspacePkg = make(map[PackageHandle]bool)
+			for _, wp := range workspacePackages {
+				isWorkspacePkg[wp] = true
+			}
 		}
 		for _, ph := range knownPkgs {
 			pkg, err := ph.Check(sc.ctx)
@@ -173,7 +266,7 @@ func (sc *symbolCollector) viewsToPackages() (toWalk []*pkgView, err error) {
 			toAdd := &pkgView{
 				pkg:         pkg,
 				view:        v,
-				isWorkspace: isWorkspacePkg[ph],
+				isWorkspace: sc.workspaceOnly || isWorkspacePkg[ph],
 			}
 			if pkg.ForTest() != "" {
 				forTests = append(forTests, toAdd)
@@ -233,6 +326,12 @@ func (sc *symbolCollector) viewsToPackages() (toWalk []*pkgView, err error) {
 	return
 }
 
+func tokenIsOption(token string, option symbolOption) (bool, string) {
+	pref := string(option) + optionSeparator
+	match := strings.HasPrefix(token, pref)
+	return match, strings.TrimPrefix(token, pref)
+}
+
 func (sc *symbolCollector) walkFilesDecls(decls []ast.Decl, prefix string) {
 	for _, decl := range decls {
 		switch decl := decl.(type) {
@@ -249,19 +348,29 @@ func (sc *symbolCollector) walkFilesDecls(decls []ast.Decl, prefix string) {
 				}
 			}
 			target := prefix + "." + fn
-			sc.match(target, kind, decl.Name)
+			if !sc.exportedOnly || decl.Name.IsExported() {
+				sc.match(target, kind, decl.Name)
+			}
 		case *ast.GenDecl:
 			for _, spec := range decl.Specs {
 				switch spec := spec.(type) {
 				case *ast.TypeSpec:
 					target := prefix + "." + spec.Name.Name
-					sc.match(target, typeToKind(sc.currPkg.GetTypesInfo().TypeOf(spec.Type)), spec.Name)
+					if !sc.exportedOnly || spec.Name.IsExported() {
+						sc.match(target, typeToKind(sc.currPkg.GetTypesInfo().TypeOf(spec.Type)), spec.Name)
+					}
 					switch st := spec.Type.(type) {
 					case *ast.StructType:
+						if !sc.structFields {
+							continue
+						}
 						for _, field := range st.Fields.List {
 							sc.walkField(field, protocol.Field, target)
 						}
 					case *ast.InterfaceType:
+						if !sc.interfaceMethods {
+							continue
+						}
 						for _, field := range st.Methods.List {
 							kind := protocol.Method
 							if len(field.Names) == 0 {
@@ -277,7 +386,9 @@ func (sc *symbolCollector) walkFilesDecls(decls []ast.Decl, prefix string) {
 						if decl.Tok == token.CONST {
 							kind = protocol.Constant
 						}
-						sc.match(target, kind, name)
+						if !sc.exportedOnly || name.IsExported() {
+							sc.match(target, kind, name)
+						}
 					}
 				}
 			}
@@ -289,12 +400,16 @@ func (sc *symbolCollector) walkField(field *ast.Field, kind protocol.SymbolKind,
 	if len(field.Names) == 0 {
 		name := types.ExprString(field.Type)
 		target := prefix + "." + name
-		sc.match(target, kind, field)
+		if !sc.exportedOnly || token.IsExported(name) {
+			sc.match(target, kind, field)
+		}
 		return
 	}
 	for _, name := range field.Names {
 		target := prefix + "." + name.Name
-		sc.match(target, kind, name)
+		if !sc.exportedOnly || name.IsExported() {
+			sc.match(target, kind, name)
+		}
 	}
 }
 
@@ -371,6 +486,11 @@ func (sc *symbolCollector) match(name string, kind protocol.SymbolKind, node ast
 		return
 	}
 	sc.seen[key] = true
+	if sc.kinds != nil {
+		if !sc.kinds[kind] {
+			return
+		}
+	}
 	sc.matcher.gather(key)
 }
 
