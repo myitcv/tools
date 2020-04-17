@@ -6,16 +6,21 @@ package source
 
 import (
 	"context"
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
+	"sort"
 	"strings"
 
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/fuzzy"
 	"golang.org/x/tools/internal/lsp/protocol"
+	errors "golang.org/x/xerrors"
 )
 
+// maxSymbols defines the maximum number of protocol.SymbolInformation results
+// that should ever be sent in response to a client
 const maxSymbols = 100
 
 // WorkspaceSymbols matches symbols across views using the given query,
@@ -41,88 +46,194 @@ func WorkspaceSymbols(ctx context.Context, matcherType SymbolMatcher, views []Vi
 	if query == "" {
 		return nil, nil
 	}
+	sc := newSymbolCollector(ctx, matcherType, query, views)
+	return sc.walk()
+}
 
-	matcher := makeMatcher(matcherType, query)
-	seen := make(map[string]struct{})
-	var symbols []protocol.SymbolInformation
-outer:
-	for _, view := range views {
-		knownPkgs, err := view.Snapshot().KnownPackages(ctx)
+// symbolCollector is a convenience type for holding context as we walk the
+// View instances (ultimately Package instances) gathering symbols that match a
+// given query
+type symbolCollector struct {
+	ctx context.Context
+
+	// query is the user-supplied query passed to the Symbol method
+	query string
+
+	// views are the View instances to walk
+	views []View
+
+	// currView is the View we are currently walking
+	currView View
+
+	// currPkg is the Package we are currently walking
+	currPkg Package
+
+	// matcher is the symbolMatcher used to gather matches as we walk
+	matcher symbolMatcher
+
+	// seen is a map of the symbols we have already visited. See the comment for
+	// viewsToPackages
+	seen map[symbolInformation]bool
+}
+
+func newSymbolCollector(ctx context.Context, matcher SymbolMatcher, query string, views []View) *symbolCollector {
+	var m symbolMatcher
+	switch matcher {
+	case SymbolFuzzy:
+		m = newFuzzySymbolMatcher(query)
+	case SymbolCaseInsensitive:
+		m = newCaseBasedSymbolMatcher(false, query)
+	case SymbolCaseSensitive:
+		m = newCaseBasedSymbolMatcher(true, query)
+	default:
+		panic(fmt.Errorf("unkown Matcher type: %v", matcher))
+	}
+	return &symbolCollector{
+		ctx:     ctx,
+		views:   views,
+		matcher: m,
+		seen:    make(map[symbolInformation]bool),
+	}
+}
+
+// walk walks sc.views gathering symbols and returns the results
+func (sc *symbolCollector) walk() (_ []protocol.SymbolInformation, err error) {
+	toWalk, err := sc.viewsToPackages()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		switch r := recover().(type) {
+		case nil:
+		case knownSymbolError:
+			if r != earlySymbolWalkExit {
+				err = r
+			}
+		default:
+			panic(r)
+		}
+	}()
+	for _, pv := range toWalk {
+		sc.currPkg = pv.pkg
+		sc.currView = pv.view
+		for _, fh := range pv.pkg.CompiledGoFiles() {
+			file, _, _, _, err := fh.Cached()
+			sc.check(err, "failed to get Cached file handle: %v", err)
+			sc.walkFilesDecls(file.Decls, pv.pkg.PkgPath())
+		}
+	}
+	return sc.matcher.results(), nil
+}
+
+// viewsToPackages gathers the packages we are going to inspect for symbols.
+// This pre-step is required in order to filter out any "duplicate"
+// *types.Package. The duplicates arise for packages that have test variants.
+// For example, if package mod.com/p has test files, then we will visit two
+// packages that have the PkgPath() mod.com/p: the first is the actual package
+// mod.com/p, the second is a special version that includes the non-XTest
+// _test.go files. If we were to walk both of of these packages, then we would
+// get duplicate matching symbols and we would waste effort. Therefore where
+// test variants exist we walk those (because they include any symbols defined
+// in non-XTest _test.go files)
+//
+// One further complication is that even after this filtering, packages between
+// views might not be "identical" because they can be built using different
+// build constraints (via the "env" config option).
+//
+// Therefore on a per view basis we first build up a map of PkgPath() ->
+// *types.Package preferring the test variants if they exist. Then we merge the
+// results between views, de-duping by *types.Package.
+//
+// Finally, when we come to walk these packages and start gathering symbols, we
+// ignore any symbols we have already seen (different *types.Package for the
+// same import path because of different build constraints), keeping track of
+// those symbols via symbolCollector.seen.
+func (sc *symbolCollector) viewsToPackages() (toWalk []*pkgView, err error) {
+	gather := make(map[string]map[*types.Package]*pkgView)
+	for _, v := range sc.views {
+		seen := make(map[string]*pkgView)
+		var forTests []*pkgView
+		knownPkgs, err := v.Snapshot().KnownPackages(sc.ctx)
 		if err != nil {
 			return nil, err
 		}
+		workspacePackages, err := v.Snapshot().WorkspacePackages(sc.ctx)
+		if err != nil {
+			return nil, err
+		}
+		isWorkspacePkg := make(map[PackageHandle]bool)
+		for _, wp := range workspacePackages {
+			isWorkspacePkg[wp] = true
+		}
 		for _, ph := range knownPkgs {
-			pkg, err := ph.Check(ctx)
+			pkg, err := ph.Check(sc.ctx)
 			if err != nil {
 				return nil, err
 			}
-			if _, ok := seen[pkg.PkgPath()]; ok {
-				continue
+			toAdd := &pkgView{
+				pkg:         pkg,
+				view:        v,
+				isWorkspace: isWorkspacePkg[ph],
 			}
-			seen[pkg.PkgPath()] = struct{}{}
-			for _, fh := range pkg.CompiledGoFiles() {
-				file, _, _, _, err := fh.Cached()
-				if err != nil {
-					return nil, err
-				}
-				for _, si := range findSymbol(file.Decls, pkg.GetTypesInfo(), matcher, pkg.PkgPath()) {
-					mrng, err := posToMappedRange(view, pkg, si.node.Pos(), si.node.End())
-					if err != nil {
-						event.Error(ctx, "Error getting mapped range for node", err)
-						continue
-					}
-					rng, err := mrng.Range()
-					if err != nil {
-						event.Error(ctx, "Error getting range from mapped range", err)
-						continue
-					}
-					symbols = append(symbols, protocol.SymbolInformation{
-						Name: si.name,
-						Kind: si.kind,
-						Location: protocol.Location{
-							URI:   protocol.URIFromSpanURI(mrng.URI()),
-							Range: rng,
-						},
-					})
-					if len(symbols) > maxSymbols {
-						break outer
-					}
-				}
+			if pkg.ForTest() != "" {
+				forTests = append(forTests, toAdd)
+			} else {
+				seen[pkg.PkgPath()] = toAdd
 			}
 		}
-	}
-	return symbols, nil
-}
-
-type symbolInformation struct {
-	name string
-	kind protocol.SymbolKind
-	node ast.Node
-}
-
-type matcherFunc func(string) bool
-
-func makeMatcher(m SymbolMatcher, query string) matcherFunc {
-	switch m {
-	case SymbolFuzzy:
-		fm := fuzzy.NewMatcher(query)
-		return func(s string) bool {
-			return fm.Score(s) > 0
+		for _, pkg := range forTests {
+			seen[pkg.pkg.PkgPath()] = pkg
 		}
-	case SymbolCaseSensitive:
-		return func(s string) bool {
-			return strings.Contains(s, query)
-		}
-	default:
-		q := strings.ToLower(query)
-		return func(s string) bool {
-			return strings.Contains(strings.ToLower(s), q)
+		for _, pkg := range seen {
+			pm, ok := gather[pkg.pkg.PkgPath()]
+			if !ok {
+				pm = make(map[*types.Package]*pkgView)
+				gather[pkg.pkg.PkgPath()] = pm
+			}
+			pm[pkg.pkg.GetTypes()] = pkg
 		}
 	}
+	for _, pm := range gather {
+		for _, pkg := range pm {
+			toWalk = append(toWalk, pkg)
+		}
+	}
+	// Now sort for stability of results. We order by
+	// (pkgView.isWorkspace, pkgView.v, pkgView.p.ID())
+	sort.Slice(toWalk, func(i, j int) bool {
+		lhs := toWalk[i]
+		rhs := toWalk[j]
+		var cmp int
+		// workspace packages first
+		switch {
+		case lhs.isWorkspace == rhs.isWorkspace:
+			cmp = 0
+		case lhs.isWorkspace:
+			cmp = -1
+		case rhs.isWorkspace:
+			cmp = 1
+		}
+		if cmp == 0 {
+			var lhsIndex, rhsIndex int
+			for i, v := range sc.views {
+				if v == lhs.view {
+					lhsIndex = i
+				}
+				if v == rhs.view {
+					rhsIndex = i
+				}
+			}
+			cmp = lhsIndex - rhsIndex
+		}
+		if cmp == 0 {
+			cmp = strings.Compare(lhs.pkg.ID(), rhs.pkg.ID())
+		}
+		return cmp < 0
+	})
+	return
 }
 
-func findSymbol(decls []ast.Decl, info *types.Info, matcher matcherFunc, prefix string) []symbolInformation {
-	var result []symbolInformation
+func (sc *symbolCollector) walkFilesDecls(decls []ast.Decl, prefix string) {
 	for _, decl := range decls {
 		switch decl := decl.(type) {
 		case *ast.FuncDecl:
@@ -138,29 +249,17 @@ func findSymbol(decls []ast.Decl, info *types.Info, matcher matcherFunc, prefix 
 				}
 			}
 			target := prefix + "." + fn
-			if matcher(target) {
-				result = append(result, symbolInformation{
-					name: target,
-					kind: kind,
-					node: decl.Name,
-				})
-			}
+			sc.match(target, kind, decl.Name)
 		case *ast.GenDecl:
 			for _, spec := range decl.Specs {
 				switch spec := spec.(type) {
 				case *ast.TypeSpec:
 					target := prefix + "." + spec.Name.Name
-					if matcher(target) {
-						result = append(result, symbolInformation{
-							name: target,
-							kind: typeToKind(info.TypeOf(spec.Type)),
-							node: spec.Name,
-						})
-					}
+					sc.match(target, typeToKind(sc.currPkg.GetTypesInfo().TypeOf(spec.Type)), spec.Name)
 					switch st := spec.Type.(type) {
 					case *ast.StructType:
 						for _, field := range st.Fields.List {
-							result = append(result, findFieldSymbol(field, protocol.Field, matcher, target)...)
+							sc.walkField(field, protocol.Field, target)
 						}
 					case *ast.InterfaceType:
 						for _, field := range st.Methods.List {
@@ -168,29 +267,35 @@ func findSymbol(decls []ast.Decl, info *types.Info, matcher matcherFunc, prefix 
 							if len(field.Names) == 0 {
 								kind = protocol.Interface
 							}
-							result = append(result, findFieldSymbol(field, kind, matcher, target)...)
+							sc.walkField(field, kind, target)
 						}
 					}
 				case *ast.ValueSpec:
 					for _, name := range spec.Names {
 						target := prefix + "." + name.Name
-						if matcher(target) {
-							kind := protocol.Variable
-							if decl.Tok == token.CONST {
-								kind = protocol.Constant
-							}
-							result = append(result, symbolInformation{
-								name: target,
-								kind: kind,
-								node: name,
-							})
+						kind := protocol.Variable
+						if decl.Tok == token.CONST {
+							kind = protocol.Constant
 						}
+						sc.match(target, kind, name)
 					}
 				}
 			}
 		}
 	}
-	return result
+}
+
+func (sc *symbolCollector) walkField(field *ast.Field, kind protocol.SymbolKind, prefix string) {
+	if len(field.Names) == 0 {
+		name := types.ExprString(field.Type)
+		target := prefix + "." + name
+		sc.match(target, kind, field)
+		return
+	}
+	for _, name := range field.Names {
+		target := prefix + "." + name.Name
+		sc.match(target, kind, name)
+	}
 }
 
 func typeToKind(typ types.Type) protocol.SymbolKind {
@@ -220,32 +325,162 @@ func typeToKind(typ types.Type) protocol.SymbolKind {
 	return protocol.Variable
 }
 
-func findFieldSymbol(field *ast.Field, kind protocol.SymbolKind, matcher matcherFunc, prefix string) []symbolInformation {
-	var result []symbolInformation
+// earlySymbolWalkExit is a sentinel error used by a symbolCollector or a
+// symbolMatcher to cleanly exit the symbol walk early
+var earlySymbolWalkExit = knownSymbolError{errors.New("early exit from symbol walk")}
 
-	if len(field.Names) == 0 {
-		name := types.ExprString(field.Type)
-		target := prefix + "." + name
-		if matcher(target) {
-			result = append(result, symbolInformation{
-				name: target,
-				kind: kind,
-				node: field,
-			})
-		}
-		return result
+// knownSymbolError is type used to wrap and distinguish errors we knowingly
+// panic with from runtime panics. It is used by (*symbolCollector).walk()
+type knownSymbolError struct {
+	error
+}
+
+// check verifies that err is nil, panic-ing with a knownSymbolErr otherwise using
+// format and args as inputs to fmt.Errorf. This gives symbol walking a trivial
+// way to exit early on unexpected (but known) errors.
+func (sc *symbolCollector) check(err error, format string, args ...interface{}) {
+	if err != nil {
+		panic(knownSymbolError{fmt.Errorf(format, args...)})
 	}
+}
 
-	for _, name := range field.Names {
-		target := prefix + "." + name.Name
-		if matcher(target) {
-			result = append(result, symbolInformation{
-				name: target,
-				kind: kind,
-				node: name,
-			})
+// match finds matches and gathers the symbol identified by name, kind and node
+// via the symbolCollector's matcher after first de-duping against previously
+// seen symbols.
+func (sc *symbolCollector) match(name string, kind protocol.SymbolKind, node ast.Node) {
+	// TODO: improve the error handling here. These two calls seemingly
+	// fail because of cgo related issues. For now we silently return, i.e.
+	// skipping the attempt to add the match.
+	mrng, err := posToMappedRange(sc.currView, sc.currPkg, node.Pos(), node.End())
+	if err != nil {
+		return
+	}
+	rng, err := mrng.Range()
+	if err != nil {
+		return
+	}
+	key := symbolInformation{
+		Name: name,
+		Kind: kind,
+		Location: protocol.Location{
+			URI:   protocol.URIFromSpanURI(mrng.URI()),
+			Range: rng,
+		},
+	}
+	if sc.seen[key] {
+		return
+	}
+	sc.seen[key] = true
+	sc.matcher.gather(key)
+}
+
+// pkgView is a simple container for a Package, the View from which we gained a
+// reference to the Package, and whether that Package is part of the workspace
+// (i.e. is within the main module)
+type pkgView struct {
+	pkg         Package
+	view        View
+	isWorkspace bool
+}
+
+// symbolInformation is a cut-down version of protocol.SymbolInformation that
+// allows struct values of this type to be used as map keys.
+type symbolInformation struct {
+	Name     string
+	Kind     protocol.SymbolKind
+	Location protocol.Location
+}
+
+// asProtocolSymbolInformation converts s to a protocol.SymbolInformation value
+//
+// TODO: work out how to handle tags if/when they are needed
+func (s symbolInformation) asProtocolSymbolInformation() protocol.SymbolInformation {
+	return protocol.SymbolInformation{
+		Name:     s.Name,
+		Kind:     s.Kind,
+		Location: s.Location,
+	}
+}
+
+// symbolMatcher defines the interface for a symbol matcher used by a symbolCollector
+type symbolMatcher interface {
+	gather(symbolInformation)
+	results() []protocol.SymbolInformation
+}
+
+// caseBasedSymbolMatcher implements symbolMatcher for case-based matching of symbol
+// names
+type caseBasedSymbolMatcher struct {
+	matcher func(string) bool
+	res     []protocol.SymbolInformation
+}
+
+func newCaseBasedSymbolMatcher(caseSensitive bool, query string) *caseBasedSymbolMatcher {
+	res := &caseBasedSymbolMatcher{}
+	if caseSensitive {
+		res.matcher = func(s string) bool {
+			return strings.Contains(s, query)
+		}
+	} else {
+		q := strings.ToLower(query)
+		res.matcher = func(s string) bool {
+			return strings.Contains(strings.ToLower(s), q)
 		}
 	}
+	return res
+}
 
-	return result
+func (c *caseBasedSymbolMatcher) gather(si symbolInformation) {
+	if c.matcher(si.Name) {
+		c.res = append(c.res, si.asProtocolSymbolInformation())
+		if len(c.res) > maxSymbols {
+			panic(earlySymbolWalkExit)
+		}
+	}
+}
+
+func (c *caseBasedSymbolMatcher) results() []protocol.SymbolInformation {
+	return c.res
+}
+
+// caseBasedSymbolMatcher implements symbolMatcher for fuzzy matching of symbol
+// names
+type fuzzySymbolMatcher struct {
+	fm  *fuzzy.Matcher
+	res []scoredSymbolInformation
+}
+
+func newFuzzySymbolMatcher(query string) *fuzzySymbolMatcher {
+	return &fuzzySymbolMatcher{
+		fm: fuzzy.NewMatcher(query),
+	}
+}
+
+func (f *fuzzySymbolMatcher) gather(si symbolInformation) {
+	score := f.fm.Score(si.Name)
+	if score > 0 {
+		f.res = append(f.res, scoredSymbolInformation{
+			symbolInformation: si,
+			score:             score,
+		})
+	}
+}
+
+func (f *fuzzySymbolMatcher) results() (res []protocol.SymbolInformation) {
+	sort.Slice(f.res, func(i, j int) bool {
+		return f.res[i].score < f.res[j].score
+	})
+	pickFrom := f.res
+	if len(pickFrom) > maxSymbols {
+		pickFrom = pickFrom[:maxSymbols]
+	}
+	for _, si := range pickFrom {
+		res = append(res, si.asProtocolSymbolInformation())
+	}
+	return
+}
+
+type scoredSymbolInformation struct {
+	symbolInformation
+	score float32
 }
